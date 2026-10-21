@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""Unduh sumber data kamus gratis (tanpa token) ke ../data/.
+
+Sumber:
+  1. nsulistiyawan/sastra-jawa  -> data/dictionary.csv (ID->JV, ~581 KB)
+  2. kaikki.org Javanese        -> data/kaikki-jv.jsonl (JV->EN, ~8,2 MB)
+  3. lantip/batangan           -> data/kamus_batangan.json (JV->JV Poerwadarminta, ~787 KB)
+  4. Habibzz01/kamus-jawa-api  -> data/habib_entry.ts (padanan ngoko->krama, ~1,6 MB)
+
+CATATAN: dataset Hugging Face junwatu/javanese-multilingual-lexicon (202 rb entri)
+bersifat gated (perlu login + token HF). Bila file JSONL-nya sudah tersedia manual
+di data/, build_kamus.py otomatis memakainya -- lihat HF_PAIRS di sana.
+
+Usage:
+    python3 tools/fetch_data.py
+"""
+import os
+import sys
+import urllib.request
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA = os.path.join(ROOT, "data")
+
+SOURCES = [
+    ("https://raw.githubusercontent.com/nsulistiyawan/sastra-jawa/master/csv/dictionary.csv",
+     "dictionary.csv"),
+    ("https://kaikki.org/dictionary/Javanese/kaikki.org-dictionary-Javanese.jsonl",
+     "kaikki-jv.jsonl"),
+    ("https://raw.githubusercontent.com/lantip/batangan/master/src/constants/kamus_batangan.json",
+     "kamus_batangan.json"),
+    ("https://raw.githubusercontent.com/Habibzz01/kamus-jawa-api/main/api/entry.ts",
+     "habib_entry.ts"),
+]
+
+
+def fetch(url, dest):
+    req = urllib.request.Request(url, headers={"User-Agent": "BasaJawa-Offline/1.0"})
+    with urllib.request.urlopen(req, timeout=120) as r, open(dest, "wb") as f:
+        total = 0
+        while True:
+            chunk = r.read(65536)
+            if not chunk:
+                break
+            f.write(chunk)
+            total += len(chunk)
+    print(f"  {os.path.basename(dest)}: {total} bytes <- {url}")
+    return total
+
+
+def main() -> None:
+    os.makedirs(DATA, exist_ok=True)
+    for url, name in SOURCES:
+        dest = os.path.join(DATA, name)
+        if os.path.exists(dest) and os.path.getsize(dest) > 0:
+            print(f"  {name}: sudah ada ({os.path.getsize(dest)} bytes), lewati")
+            continue
+        fetch(url, dest)
+    print("FETCH_OK")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

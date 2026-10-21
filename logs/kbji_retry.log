@@ -1,0 +1,3 @@
+  robots.txt: User-agent: * | Disallow: /hero/ |  | Sitemap: https://kbji.kemendikdasmen.go.id/sitemap/sitemap-index.xml | 
+  sudah selesai: 19803 slug
+  antre: 17874 slug, workers=4, delay=0.5

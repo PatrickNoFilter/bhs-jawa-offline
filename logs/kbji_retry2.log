@@ -1,0 +1,8 @@
+  robots.txt: User-agent: * | Disallow: /hero/ |  | Sitemap: https://kbji.kemendikdasmen.go.id/sitemap/sitemap-index.xml | 
+  sudah selesai: 37476 slug
+  antre: 201 slug, workers=4, delay=0.5
+  [113/201] petr%C3%A8k_petr%C3%A8k gagal: HTTP Error 400: Bad Request
+  [150/201] s%C3%A9rang%2C%20s%C3%A9rangan%20%28sawah%20s%C3%A9rang%5Ban%5D%29 gagal: HTTP Error 400: Bad Request
+  [154/201] sho%E2%80%99 gagal: HTTP Error 400: Bad Request
+  [200/201] 4106 entri, 3 gagal...
+DETAILS_OK: +4106 entri, 3 gagal

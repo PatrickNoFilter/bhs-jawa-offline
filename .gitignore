@@ -1,0 +1,14 @@
+# Signing keystore — never commit. Lives only on the build phone.
+**/keystore.jks
+*.jks
+
+# Build intermediates
+apk/tmp/
+__pycache__/
+*.pyc
+*.pid
+
+# apksigner signature sidecars
+*.idsig
+
+.DS_Store

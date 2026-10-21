@@ -1,0 +1,223 @@
+# RENCANA — Kamus & Ensiklopedia Basa Jawa Offline
+
+> **Pola acuan:** `/storage/emulated/0/katolik-digital-offline`
+> (HTML tunggal + WebView wrapper → APK, **tanpa Gradle**)
+> Rencana ini menyalin pola tersebut dan menyesuaikannya untuk aplikasi kamus/ensiklopedia Jawa.
+
+---
+
+## 1. Kesimpulan & Keputusan Arsitektur
+
+| Pertanyaan | Jawaban |
+|---|---|
+| HTML → APK? | **Ya.** Pola yang sama dengan aplikasi Katolik: satu file `index.html` (+ file data `.js`) dibungkus `MainActivity.java` (WebView), dibangun dengan `javac → d8 → aapt2 → zip → zipalign → apksigner`. Sudah terbukti jalan (v1.0 → v2.9, 30–57 MB) di perangkat ini. |
+| Ada cara yang lebih baik? | Untuk kasus ini **tidak perlu**. Native/SQLite memang lebih cepat untuk >500 rb entri, tapi menambah kompleksitas Gradle, Kotlin, Room, dll. Pencarian JS (`toLowerCase` + `indexOf`/`includes`, pola yang dipakai Katolik) cukup untuk ~200 rb entri kamus + ensiklopedia, selama data dipecah per huruf/kategori dan dimuat malas (*lazy load*). |
+| Toolchain | Semua sudah tersedia di perangkat ini: `java/javac` (JDK 25), `python3`, `zip/unzip`, `qemu-x86_64`, dan SDK Android (build-tools 34.0.0 + android-35) **bisa dipakai ulang** dari `katolik-digital-offline/apk/sdk/` — tanpa download ulang. |
+
+### Nama & identitas (usulan)
+
+| Item | Nilai |
+|---|---|
+| Nama aplikasi | **Basa Jawa Offline** (Kamus & Ensiklopedia) |
+| Package | `id.basajawa.offline` |
+| Folder kerja | `/storage/emulated/0/Bhs Jawa Offline/` |
+| Source HTML utama | `index.html` (di folder kerja) |
+| Versi awal | `1.0` (versionCode `1`), minSdk 24 / targetSdk 35 |
+| Izin | **tanpa INTERNET** (murni offline, seperti Katolik) |
+| Keystore | auto-generate baru (`keystore.jks`, alias `basajawa`) — **jangan pakai keystore Katolik** |
+
+---
+
+## 2. Sumber Data (hasil riset sebelumnya)
+
+### 2.1 Kamus (prioritas utama)
+
+| # | Sumber | Isi | Format | Ukuran | Lisensi | Cara ambil |
+|---|---|---|---|---|---|---|
+| 1 | **Hugging Face `junwatu/javanese-multilingual-lexicon`** | 202.912 entri dari 32 sumber (1830–2010): `ind_jav`, `jav_jav`, `jav_en`, `kawi_ind`, `kawi_jav`, `jav_nl`, `jav_fr` | JSONL (`data/leksikon_all.jsonl` + `data/by_pair/*.jsonl`) | puluhan MB | **CC BY-NC 4.0** (Yayasan Sastra Lestari) | `huggingface_hub` / git clone / download langsung |
+| 2 | **GitHub `nsulistiyawan/sastra-jawa`** | `csv/dictionary.csv` (~595 KB: Indonesia → Jawa, sudah diverifikasi isinya valid), `dasanama.csv`, bebashan/saloka | CSV | kecil | cek lisensi repo (klaim "developer friendly") | `raw.githubusercontent.com` |
+| 3 | **kaikki.org Javanese** | Ekstrak Wiktionary Inggris bagian Jawa, siap mesin | JSONL `kaikki.org-dictionary-Javanese.jsonl` | 8,2 MB (~5.584 kata) | CC BY-SA | download langsung dari `kaikki.org/dictionary/Javanese/` |
+| 4 | **Dump Wiktionary resmi** | `enwiktionary` (bagian Jawa) & `jvwiktionary` (kamus Jawa-Jawa) — terkonfirmasi tersedia | XML dump | besar | CC BY-SA | `dumps.wikimedia.org` |
+| 5 | Cadangan | `sastra.org` (arsip asli), repo kecil GitHub (`bausastra-jawa`, `batangan` daftar kata Poerwadarminta, `BosoJowo`) | beragam | — | beragam | sesuai kebutuhan |
+
+> ⚠️ **Catatan lisensi:** dataset HF (sumber #1, yang terlengkap) berlisensi **CC BY-NC 4.0 = non-komersial**. Aplikasi pribadi/offline/side-load OK, tetapi **tidak boleh dijual / dimonetisasi Play Store**. Wajib mencantumkan atribusi Yayasan Sastra Lestari + sastra.org di halaman "Tentang". Data Wiktionary (CC BY-SA) juga wajib atribusi + share-alike bila dipakai.
+
+### 2.2 Ensiklopedia (prioritas kedua)
+
+| Sumber | Keterangan |
+|---|---|
+| **Wikipedia Jawa (`jvwiki`) dump** | Artikel ensiklopedia berbahasa Jawa; ambil artikel pilihan (mis. 1.000–5.000 artikel populer/berkualitas), bersihkan markup → cuplikan HTML ringan. Lisensi CC BY-SA, wajib atribusi. |
+| **sastra.org** | Tembang, babad, karya sastra — bagus sebagai tab "Sastra", bukan ensiklopedia murni. |
+| **Ringkasan buatan sendiri** | Untuk topik budaya Jawa (aksara, unggah-ungguh, wayang, dsb.) bila artikel jvwiki kurang. |
+
+### 2.3 MVP (versi 1.0) — batasi cakupan dulu
+
+Untuk menjaga ukuran APK wajar (target **< 80 MB**, sebanding Katolik v2.9 = 57 MB):
+
+1. **Kamus inti:** pasangan `ind_jav` + `jav_jav` dari HF (dipekatkan) + `dictionary.csv` sastra-jawa sebagai pelengkap. Target ~50–100 rb entri unik.
+2. **Fitur bahasa:** penanda Ngoko/Krama bila tersedia di data; bila tidak, tampilkan semua padanan seperti `dictionary.csv` (`umum; ke. 'am`).
+3. **Ensiklopedia:** 500–1.000 artikel jvwiki terpopuler, cuplikan ringkas (±2–5 KB/artikel → ±2–5 MB).
+4. **Favorit & riwayat** via `localStorage` (pola Katolik).
+5. Pasangan `kawi_*`, `jav_nl`, `jav_fr` dan artikel penuh → **ditunda ke v2.0+**.
+
+---
+
+## 3. Arsitektur Aplikasi (menyalin pola Katolik)
+
+```
+Bhs Jawa Offline/
+├── index.html              ← APLIKASI UTAMA (single-file: CSS+JS inline, seperti Katolik)
+├── kamus_data.js           ← data kamus (mirip alkitab_data.js 5,5 MB)
+├── ensiklopedi_data.js     ← data ensiklopedia (boleh digabung/v2)
+├── tools/
+│   ├── fetch_hf.py         ← unduh JSONL dari Hugging Face          (mirip ekatolik_fetch.py)
+│   ├── build_kamus.py      ← JSONL/CSV → kamus_data.js ringkas      (mirip embed_fulltext.py)
+│   └── fetch_jvwiki.py     ← unduh + bersihkan artikel jvwiki (v2)
+├── apk/
+│   ├── app/
+│   │   ├── src/id/basajawa/offline/MainActivity.java   ← SALIN dari Katolik, ganti package
+│   │   ├── AndroidManifest.xml                          ← SALIN, ganti package/nama/versi
+│   │   ├── assets/          (diisi saat build: index.html + *_data.js)
+│   │   └── res/{drawable/ic_launcher.png, values/strings.xml}
+│   ├── scripts/
+│   │   ├── 01_build_apk.sh  ← SALIN dari Katolik, sesuaikan nama/path/versi
+│   │   └── make_icon.py     ← SALIN, sesuaikan warna/logo (mis. aksara ꦧ)
+│   ├── sdk -> ../../katolik-digital-offline/apk/sdk   ← PAKAI ULANG (symlink), tanpa 00_setup_sdk.sh
+│   ├── keystore.jks         ← generate baru saat build pertama
+│   └── dist/                ← hasil: BasaJawa-Offline-v1.0.apk
+└── RENCANA.md (file ini)
+```
+
+### 3.1 `index.html` — struktur UI (meniru kerangka Katolik)
+
+Kerangka Katolik yang dipakai ulang: `<header>` sticky + judul, `nav.chips` (filter), `.searchwrap` (kotak cari + hint), konten kartu, CSS variable (`:root`), font sistem, tanpa dependensi eksternal.
+
+Tab utama (ganti `booknav` Katolik):
+
+| Tab | Fungsi |
+|---|---|
+| 🔍 **Kamus** (default) | Satu kotak cari untuk **semua 4 kamus sekaligus** (ID→JV / JV→ID / JV→JV / JV→EN), hasil berkelompok per kamus + chip huruf A–Z + filter tingkat tutur. Kartu **terjemahan ngoko→kromo otomatis** muncul di atas hasil bila ada padanan (toggle Kromo/Kromo Inggil, frasa multi-kata, kata asing ditandai) |
+| ⭐ **Favorit** | Tersimpan di `localStorage` (pola Katolik: 26 pemakaian `localStorage`) |
+| ℹ️ **Tentang** | Atribusi lisensi (wajib CC BY-NC / BY-SA) + versi |
+
+Fitur cari (pola Katolik: `toLowerCase` + `startsWith`/`indexOf`/`includes`):
+
+1. **Awalan persis** (`startsWith`) — prioritas tertinggi, mis. `buku → …`.
+2. **Mengandung** (`includes`) — mis. `uku → buku, kuku`.
+3. **Normalisasi** — abaikan kapital & varian ejaan lama (`dj→j`, `tj→c`, `oe→u`, `j→y`?) karena data HF banyak ejaan pra-1972. Ini penting: tanpa normalisasi, pencarian modern gagal menemukan entri lama.
+4. Batas hasil (mis. 200) + "muat lagi" agar WebView tidak macet.
+
+### 3.2 Format data `kamus_data.js`
+
+Dipadatkan saat build (jangan bawa mentah 200 rb baris JSONL ke HP):
+
+```js
+// Dibangkitkan tools/build_kamus.py — JANGAN edit manual
+const KAMUS_META = {version:"1.0", n: 84210, pairs:["ind_jav","jav_jav"], built:"2026-10-11"};
+const KAMUS_ID_JV = {"a": [["aba","bapa.","ngoko"], ...], ...};  // [kata, arti, info, level]
+const KAMUS_PADANAN = {"a": [["abang","abrit",""], ...], ...};   // [ngoko, krama, inggil]
+```
+
+- Elemen ke-4 = tingkat tutur/asal (dipisah koma): `ngoko,krama,inggil,andhap,kasar,
+  cakapan,dialek,arkais,arab,sanskerta,walanda,cina,melayu,prancis,portugis`.
+- Diekstrak otomatis (`tools/build_kamus.py::classify_all`): KBJI (KN/K/Ki→ejaan
+  "Kromo"), Bausastra (`kn./n./k./ki./ks.` + `(A)/(S)/(W)/…`), kaikki (`(krama)` di glosa);
+  ID→JV mewarisi level dari padanan Jawa yang dikenal. Tanpa penanda = ngoko (JV).
+- Sejak v1.2, `index.html` bersifat mandiri: data di-inline saat build ke wilayah
+  anchor `KAMUS-DATA-START/END` (pola single-file Katolik) agar tetap jalan saat
+  dibuka via `content://` dari file manager.
+
+- Kunci = huruf pertama (dinormalisasi) → **lazy render per huruf**, WebView hanya memegang 1 bucket di DOM.
+- Tiap entri: `[kata, arti, info, level]` — array pendek agar hemat byte (hindari object key berulang).
+- Aman-HTML: pakai fungsi `js_safe_json()` persis seperti `tools/embed_fulltext.py` Katolik (`</` → `<\/`, escape U+2028/29).
+
+### 3.3 `MainActivity.java` & Manifest — yang diubah dari salinan Katolik
+
+- `package id.katolikdigital.offline;` → `package id.basajawa.offline;` (+ pindah file ke folder `src/id/basajawa/offline/`).
+- `loadUrl("file:///android_asset/index.html")` — **tetap**, tanpa perubahan.
+- Komentar/judul disesuaikan ("Kamus & Ensiklopedia Basa Jawa").
+- `AndroidManifest.xml`: `package="id.basajawa.offline"`, `versionCode="1"`, `versionName="1.0"`.
+- `res/values/strings.xml`: `app_name` → `Basa Jawa Offline`.
+- Ikon: jalankan `make_icon.py` yang disesuaikan (warna coklat/batik + huruf ꦧ).
+- **Tidak perlu INTERNET permission** — pertahankan seperti Katolik.
+
+### 3.4 `01_build_apk.sh` — yang diubah dari salinan Katolik
+
+Hanya ganti variabel & daftar aset (logika javac→d8→aapt2→zip→zipalign→apksigner **tetap 100%**):
+
+```bash
+SRC_WEB="/storage/emulated/0/Bhs Jawa Offline"
+APP=".../Bhs Jawa Offline/apk/app"
+SDK="/storage/emulated/0/katolik-digital-offline/apk/sdk"   # PAKAI ULANG
+# aset: index.html + kamus_data.js (+ ensiklopedi_data.js bila ada)
+```
+
+Perhatian khusus pola Katolik yang wajib ditiru: staging `aapt2` ke `/tmp` (FUSE `/storage` menolak `chmod`), dan `$QEMU` (`qemu-x86_64`) karena host `aarch64` — keduanya sudah terbukti jalan di sini.
+
+---
+
+## 4. Roadmap Bertahap
+
+### Fase 0 — Kerangka (½ hari)
+- [ ] Buat struktur folder §3 di `Bhs Jawa Offline/`.
+- [ ] Salin `apk/app/src/.../MainActivity.java`, `AndroidManifest.xml`, `res/`, `scripts/make_icon.py`, `scripts/01_build_apk.sh` dari Katolik; sesuaikan package/nama/path (§3.3–3.4).
+- [ ] Symlink `apk/sdk → katolik-digital-offline/apk/sdk`; verifikasi `aapt2 dump badging` jalan via qemu.
+- [ ] Build "hello world": `index.html` minimal → APK terinstal. **Kriteria sukses: APK terpasang & terbuka offline.**
+
+### Fase 1 — Pipa data kamus (1–2 hari)
+- [ ] `tools/fetch_hf.py`: unduh `ind_jav.jsonl` (+ `jav_jav.jsonl`) dari `junwatu/javanese-multilingual-lexicon` dan `dictionary.csv` sastra-jawa.
+- [ ] `tools/build_kamus.py`: dedup (kunci: kata+arti dinormalisasi), padatkan ke format §3.2, tulis `kamus_data.js` (+ laporan jumlah entri/duplikat dibuang).
+- [ ] Verifikasi tulis-ulang seperti `embed_fulltext.py` (assert marker tunggal + re-parse dari disk).
+
+### Fase 2 — UI kamus (2–3 hari)
+- [ ] `index.html`: tab Kamus + Tentang; cari 2 arah + chip A–Z + normalisasi ejaan lama + favorit/riwayat (`localStorage`).
+- [ ] Uji di browser HP dulu (buka file lokal), baru build APK.
+- [ ] Build `BasaJawa-Offline-v1.0.apk`, instal, uji offline penuh (mode pesawat).
+
+### Fase 3 — Ensiklopedia (v1.1+, 2–4 hari)
+- [ ] `tools/fetch_jvwiki.py`: 500–1.000 artikel terpopuler → `ensiklopedi_data.js`; tambah tab Ensiklopedia.
+- [ ] Halaman Tentang dilengkapi atribusi CC BY-SA Wikipedia.
+
+### Fase 4 — Poles & rilis (berkelanjutan)
+- [ ] Ikon final, splash sederhana, mode gelap (variabel CSS `:root` sudah mendukung pola ini).
+- [ ] Pola versi Katolik: naikkan `versionCode`/`versionName` tiap rilis, simpan APK di folder root (`BasaJawa-Offline-vX.Y.apk`), arsipkan `.bak` sebelum edit besar.
+
+---
+
+## 5. Estimasi Ukuran & Risiko
+
+| Komponen | Estimasi | Acuan Katolik |
+|---|---|---|
+| `index.html` (UI+CSS+JS) | 0,3–0,8 MB | 56 MB (karena data inline) |
+| `kamus_data.js` (~80 rb entri padat) | 8–20 MB | `alkitab_data.js` 5,5 MB |
+| `ensiklopedi_data.js` (~1 rb artikel) | 2–5 MB | — |
+| **Total APK v1.0** | **±10–25 MB** | v1.x ±30 MB, v2.9 57 MB |
+| **Total APK v1.1 (+ensiklopedia)** | **±15–30 MB** | masih jauh di bawah batas side-load |
+
+Risiko utama & mitigasi:
+
+1. **Data HF ber-ejaan lama/OCR kotor** → normalisasi saat cari (§3.1.3) + tampilkan label sumber/ejaan di kartu entri.
+2. **WebView lambat bila 200 rb entri dirender sekaligus** → bucket per huruf + batas 200 hasil + `content-visibility`/pagination (jangan render semua).
+3. **Lisensi campur (BY-NC + BY-SA)** → halaman Tentang wajib; aplikasi tetap gratis & offline; jangan campur data BY-SA ke dalam blob BY-NC tanpa pemisahan atribusi yang jelas.
+4. **Ukuran membengkak bila data mentah ikut** → yang dibundel hanya `*_data.js` hasil `tools/`; JSONL/CSV mentah tinggal di folder kerja, **jangan** masuk `apk/app/assets/`.
+
+---
+
+## 6. Perintah Cepat (nanti, saat eksekusi)
+
+```bash
+BJ="/storage/emulated/0/Bhs Jawa Offline"
+KAT="/storage/emulated/0/katolik-digital-offline"
+
+# 0. kerangka dari pola Katolik
+mkdir -p "$BJ"/{tools,apk/{app/assets,scripts,dist}} "$BJ/apk/app/src/id/basajawa/offline" "$BJ/apk/app/res/drawable" "$BJ/apk/app/res/values"
+ln -s "$KAT/apk/sdk" "$BJ/apk/sdk"
+
+# 1. tiap rilis
+bash "$BJ/apk/scripts/01_build_apk.sh"   # → apk/dist/BasaJawa-Offline-vX.Y.apk
+cp "$BJ/apk/dist/"*.apk "$BJ/"           # arsip di root, seperti Katolik
+```
+
+---
+
+*Ditulis 2026-10-11. Langkah berikutnya bila disetujui: Fase 0 (salin kerangka apk + build hello-world).*

@@ -1,0 +1,663 @@
+#!/usr/bin/env python3
+"""Bangun kamus_data.js dari sumber di ../data/ (pola: tools/embed_fulltext.py Katolik).
+
+Masukan (semua opsional kecuali minimal satu ada):
+  data/dictionary.csv   - sastra-jawa, ID->JV (kolom Indonesia,Javanese,Alphabet)
+  data/kaikki-jv.jsonl  - Wiktionary JV->EN (word,pos,senses[].glosses)
+  data/kamus_batangan.json - lantip/batangan (Poerwadarminta), JV->JV {kata: arti}
+  data/hf_*.jsonl       - dump manual HF junwatu/javanese-multilingual-lexicon,
+                          format {"headword":..,"definition":..} per baris;
+                          nama file menentukan pasangan, mis. hf_ind_jav.jsonl
+
+Keluaran:
+  kamus_data.js di ROOT, berisi:
+    const KAMUS_META  = {version, built, counts}
+    const KAMUS_ID_JV = {bucket: [[kata, arti], ...]}         // Indonesia -> Jawa
+    const KAMUS_JV_EN = {bucket: [[kata, arti, pos], ...]}    // Jawa -> Inggris
+
+Aturan: dedup (kata.lower(), arti); bucket = huruf pertama dinormalisasi
+(a-z, selain itu '#'); JSON aman-HTML (</ -> <\\/); verifikasi re-parse dari disk.
+
+Usage:
+    python3 tools/build_kamus.py            # bangun ../kamus_data.js
+    python3 tools/build_kamus.py --status   # lapor statistik saja
+"""
+import csv
+import json
+import os
+import re
+import sys
+import tempfile
+from datetime import date
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA = os.path.join(ROOT, "data")
+OUT = os.path.join(ROOT, "kamus_data.js")
+HTML = os.path.join(ROOT, "index.html")
+VERSION = "1.0"
+
+A_START = "<!-- KAMUS-DATA-START"
+A_END = "<!-- KAMUS-DATA-END -->"
+
+MARKER_META = "const KAMUS_META"
+MARKER_IDJV = "const KAMUS_ID_JV"
+MARKER_JVEN = "const KAMUS_JV_EN"
+MARKER_JVJV = "const KAMUS_JV_JV"
+MARKER_PAD = "const KAMUS_PADANAN"
+MARKER_KBJI = "const KAMUS_KBJI"
+MARKER_KAWI = "const KAMUS_KAWI"
+
+
+def js_safe_json(obj) -> str:
+    s = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    s = s.replace("</", "<\\/")
+    # U+2028/U+2029 via chr() agar source murni ASCII (aman dari editor)
+    s = s.replace(chr(0x2028), "\\u2028").replace(chr(0x2029), "\\u2029")
+    return s
+
+
+def bucket_of(word: str) -> str:
+    c = (word.strip().lower() + "#")[:1]
+    # normalisasi huruf berdiakritik ke a-z
+    fold = {"é": "e", "è": "e", "ê": "e", "ë": "e",
+            "á": "a", "à": "a", "â": "a",
+            "í": "i", "ì": "i", "î": "i",
+            "ó": "o", "ò": "o", "ô": "o",
+            "ú": "u", "ù": "u", "û": "u",
+            "ñ": "n", "ç": "c", "ð": "d"}
+    c = fold.get(c, c)
+    return c if "a" <= c <= "z" else "#"
+
+
+def load_csv_id_jv(path):
+    """-> list[(kata_id, arti_jawa)]"""
+    out, seen = [], set()
+    with open(path, encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            kata = (r.get("Indonesia") or "").strip()
+            arti = (r.get("Javanese") or "").strip()
+            if not kata or not arti:
+                continue
+            key = (kata.lower(), arti)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append([kata, arti])
+    return out
+
+
+def load_kaikki_jv_en(path):
+    """-> list[(kata_jv, arti_en, pos)]"""
+    out, seen = [], set()
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            o = json.loads(line)
+            if o.get("lang_code") != "jv":
+                continue
+            word = (o.get("word") or "").strip()
+            pos = (o.get("pos") or "").strip()
+            glosses = []
+            for s in o.get("senses", []):
+                for g in s.get("glosses", []):
+                    g = g.strip()
+                    if g and g not in glosses:
+                        glosses.append(g)
+            if not word or not glosses:
+                continue
+            arti = "; ".join(glosses)
+            key = (word.lower(), arti)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append([word, arti, pos])
+    return out
+
+
+def load_batangan(path):
+    """kamus_batangan.json (lantip/batangan, sumber Poerwadarminta): {kata_jv: arti}
+    -> list[(kata, arti)] JV->JV."""
+    import json as _json
+    d = _json.load(open(path, encoding="utf-8"))
+    rows, seen = [], set()
+    for kata, arti in d.items():
+        kata, arti = (kata or "").strip(), (arti or "").strip()
+        if not kata or not arti:
+            continue
+        key = (kata.lower(), arti)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append([kata, arti])
+    return rows
+
+
+def load_hf_pairs(data_dir):
+    """File data/hf_<pair>.jsonl -> {pair: [(headword, definition)]}.
+    Menerima field headword/definition atau word/gloss/arti/definisi."""
+    pairs = {}
+    for name in sorted(os.listdir(data_dir)):
+        if not (name.startswith("hf_") and name.endswith(".jsonl")):
+            continue
+        pair = name[3:-6]  # hf_ind_jav.jsonl -> ind_jav
+        rows, seen = [], set()
+        with open(os.path.join(data_dir, name), encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                o = json.loads(line)
+                head = (o.get("headword") or o.get("word") or o.get("kata") or "").strip()
+                defi = (o.get("definition") or o.get("gloss") or o.get("arti")
+                        or o.get("definisi") or "").strip()
+                if isinstance(defi, list):
+                    defi = "; ".join(str(x) for x in defi)
+                if not head or not defi:
+                    continue
+                key = (head.lower(), defi)
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append([head, defi])
+        pairs[pair] = rows
+        print(f"  hf pair {pair}: {len(rows)} entri unik")
+    return pairs
+
+
+def to_buckets(rows, key_idx=0):
+    buckets = {}
+    for row in rows:
+        b = bucket_of(row[key_idx])
+        buckets.setdefault(b, []).append(row)
+    for b in buckets:
+        buckets[b].sort(key=lambda r: r[key_idx].lower())
+    return buckets
+
+
+# ---------- klasifikasi tingkat tutur ----------
+# Sumber penanda (hasil mining 2026-10-11):
+# - KBJI: singkatan KN/K/Ki/ks/cak/dl/ar (tooltip: Kromo Ngoko/Kromo/Kromo Inggil/
+#   kasar/cakapan/dialek/arkais); di raw sudah terurai jadi teks ("Kromo Ngoko ...").
+#   Ejaan KBJI memakai "Kromo" (bukan "Krama") — bedakan dari prose "tata krama".
+# - Bausastra/Poerwadarminta (batangan): kn./n./k./ki./ks. di depan definisi;
+#   kn. = Kromo Ngoko (sejajar KN KBJI — penanda terbanyak di kedua kamus),
+#   plus asal kata (A)/(S)/(W)/(C)/(M)/(Prs)/(Prt).
+LVL_ORDER = ["ngoko", "madya", "krama", "inggil", "andhap", "kasar", "cakapan",
+             "dialek", "arkais", "arab", "sanskerta", "walanda", "cina", "melayu",
+             "prancis", "portugis"]
+LVL_LABEL = {"ngoko": "Ngoko", "madya": "Madya", "krama": "Krama",
+             "inggil": "Kr. Inggil", "andhap": "Kr. Andhap", "kasar": "Kasar",
+             "cakapan": "Cakapan", "dialek": "Dialek", "arkais": "Arkais",
+             "arab": "Arab", "sanskerta": "Sanskerta", "walanda": "Walanda",
+             "cina": "Cina", "melayu": "Melayu", "prancis": "Prancis",
+             "portugis": "Portugis"}
+
+BAUSASTRA_LEVEL = {"kn": "ngoko", "n": "ngoko", "k": "krama", "ki": "inggil",
+                   "ks": "kasar"}
+BAUSASTRA_ORIGIN = {"a": "arab", "arab": "arab", "s": "sanskerta", "w": "walanda",
+                    "c": "cina", "m": "melayu", "prs": "prancis", "prt": "portugis"}
+
+
+def _lvl_str(levels):
+    return ",".join(sorted(levels, key=LVL_ORDER.index))
+
+
+# Normalisasi ejaan — WAJIB identik dengan norm() di index.html:
+# lower -> lipat diakritik -> dj>j, tj>c, oe>u (satu pass via translate).
+_NORM_TBL = str.maketrans({
+    "é": "e", "è": "e", "ê": "e", "ë": "e",
+    "á": "a", "à": "a", "â": "a",
+    "í": "i", "ì": "i", "î": "i",
+    "ó": "o", "ò": "o", "ô": "o",
+    "ú": "u", "ù": "u", "û": "u",
+    "É": "e", "È": "e", "Ê": "e", "Ë": "e",
+    "Á": "a", "À": "a", "Â": "a",
+    "Í": "i", "Ì": "i", "Î": "i",
+    "Ó": "o", "Ò": "o", "Ô": "o",
+    "Ú": "u", "Ù": "u", "Û": "u",
+})
+
+
+def norm_py(s):
+    s = (s or "").lower().translate(_NORM_TBL)
+    return s.replace("dj", "j").replace("tj", "c").replace("oe", "u")
+
+
+def with_norm(rows):
+    """Tambah elemen nk+na -> [kata, arti, info, lv, nk, na]."""
+    return [r + [norm_py(r[0]), norm_py(r[1])] for r in rows]
+
+
+def extract_bausastra(text):
+    """Penanda depan gaya Bausastra: (ORIGIN)* LEVEL. -> (levels, sisa_teks).
+    Hanya awalan (konvensi kamus); penanda tengah (kc./ar./tmr.) diabaikan."""
+    levels, rest = set(), text.strip()
+    while True:
+        m = re.match(r"^\(([A-Za-zêéè\.]+)\)\s*", rest)
+        if m and m.group(1).lower() in BAUSASTRA_ORIGIN:
+            levels.add(BAUSASTRA_ORIGIN[m.group(1).lower()])
+            rest = rest[m.end():]
+            continue
+        break
+    m = re.match(r"^(kn|n|k|ki|ks)\.\s*", rest)
+    if m and m.group(1) in BAUSASTRA_LEVEL:
+        levels.add(BAUSASTRA_LEVEL[m.group(1)])
+        rest = rest[m.end():]
+    return levels, rest
+
+
+def extract_kbji(head, defi):
+    """Penanda KBJI (sudah terurai jadi teks oleh parser). Aturan:
+    frasa multi-kata di mana saja; 'Kromo' telanjang & token hanya di depan."""
+    levels, rest = set(), defi.strip()
+    low = rest.lower()
+    if "kromo inggil" in low or "krama inggil" in low:
+        levels.add("inggil")
+    if "kromo andhap" in low or "krama andhap" in low:
+        levels.add("andhap")
+    if "kromo ngoko" in low:
+        levels.add("ngoko")
+    m = re.match(r"^kromo\s+", low)
+    if m and not levels:
+        levels.add("krama")
+        rest = rest[m.end():]
+    else:
+        m2 = re.match(r"^(kromo (?:ngoko|inggil|andhap)|krama (?:inggil|andhap))\s+", low)
+        if m2:
+            rest = defi.strip()[m2.end():]
+    for w, lv in [("kasar", "kasar"), ("cakapan", "cakapan"), ("dialek", "dialek"),
+                  ("arkais", "arkais")]:
+        if re.search(r"\b" + w + r"\b", low):
+            levels.add(lv)
+    for tok, lv in [("KN", "ngoko"), ("Ki", "inggil"), ("ar.", "arkais"),
+                    ("cak.", "cakapan"), ("dl.", "dialek"), ("ks.", "kasar")]:
+        if re.search(r"(?<![A-Za-zêéè])" + re.escape(tok) + r"(?![A-Za-zêéè])", defi):
+            levels.add(lv)
+    if not levels:
+        levels.add("ngoko")  # konvensi KBJI: lema tak bertanda = ngoko (K & Ki eksplisit)
+    return levels, rest
+
+
+def extract_kaikki(gloss):
+    levels = set()
+    for m in re.findall(r"\((krama[^)]*|ngoko[^)]*|kromo[^)]*)\)", gloss, re.I):
+        ml = m.lower()
+        if "inggil" in ml:
+            levels.add("inggil")
+        elif "krama" in ml or "kromo" in ml:
+            levels.add("krama")
+        if "ngoko" in ml:
+            levels.add("ngoko")
+    if not levels:
+        levels.add("ngoko")
+    return levels
+
+
+HABIB_LEVEL = {"ngoko": "ngoko", "madya": "madya", "krama": "krama",
+                 "krama_inggil": "inggil", "krama_andhap": "andhap"}
+
+
+def load_habib(data_dir):
+    """data/habib_entry.ts (Habibzz01/kamus-jawa-api) ->
+    (pairs [(ngoko, krama, inggil)], jvlevels {word: set(levels)}).
+    pairs dari field krama/krama_inggil + daftar reverse."""
+    p = os.path.join(data_dir, "habib_entry.ts")
+    if not os.path.exists(p):
+        return [], {}
+    src = open(p, encoding="utf-8").read()
+    i = src.find("const KAMUS: any = ")
+    assert i >= 0, "objek KAMUS tak ditemukan di habib_entry.ts"
+    K, _ = json.JSONDecoder().raw_decode(src[i + len("const KAMUS: any = "):])
+    merged, jvlevels = {}, {}
+
+    def add_pair(ng, kr, ing):
+        ng = (ng or "").strip().lower()
+        kr = (kr or "").strip().lower()
+        ing = (ing or "").strip().lower()
+        if not ng or (not kr and not ing):
+            return
+        cur = merged.setdefault(ng, ["", ""])
+        if kr and not cur[0]:
+            cur[0] = kr
+        if ing and not cur[1]:
+            cur[1] = ing
+
+    for e in K.get("entries", []):
+        w = (e.get("word") or "").strip().lower()
+        if not w:
+            continue
+        lv = HABIB_LEVEL.get((e.get("level") or "").strip().lower())
+        if lv:
+            jvlevels.setdefault(w, set()).add(lv)
+        add_pair(e.get("word"), e.get("krama"), e.get("krama_inggil"))
+    for r in K.get("reverse", []):
+        add_pair(r.get("ngoko"), r.get("krama"), None)
+    pairs = [[ng, v[0], v[1]] for ng, v in sorted(merged.items())]
+    print(f"  habib padanan: {len(pairs)} pasangan ngoko->krama/inggil "
+          f"({sum(1 for _, k, _ in pairs if k)} krama, "
+          f"{sum(1 for _, _, g in pairs if g)} inggil)")
+    return pairs, jvlevels
+
+
+def load_kawi(data_dir):
+    """data/kamus_kawi_djvu.txt (Kamus Kawi-Djarwa Poerwadarminta, OCR archive.org)
+    -> list[(headword, definition)] dedup. Aturan: gabung wrap hyphen; kepala =
+    token comma-separated berawalan sama (>=3 huruf); orphan = lanjutan."""
+    p = os.path.join(data_dir, "kamus_kawi_djvu.txt")
+    if not os.path.exists(p):
+        return []
+    lines = open(p, encoding="utf-8", errors="replace").read().splitlines()
+    start = 0
+    for i, l in enumerate(lines):
+        if l.strip() == "A" and any("," in (lines[j] if j < len(lines) else "")
+                                    for j in range(i + 1, i + 6)):
+            start = i + 1
+            break
+    body = lines[start:]
+    joined, i = [], 0
+    while i < len(body):
+        l = body[i].rstrip()
+        if re.search(r"[A-Za-zêéè]-$", l):
+            j = i + 1
+            while j < len(body) and body[j].strip() == "":
+                j += 1
+            if j < len(body):
+                l = l[:-1] + body[j].strip()
+                i = j + 1
+            else:
+                i += 1
+            joined.append(l)
+        else:
+            joined.append(l)
+            i += 1
+    blocks, cur = [], []
+    for l in joined:
+        if l.strip() == "":
+            if cur:
+                blocks.append(cur)
+                cur = []
+        else:
+            cur.append(l)
+    if cur:
+        blocks.append(cur)
+    head_re = re.compile(r"^[A-Za-zêéè][A-Za-zêéè\-]*$")
+    entries, seen, skipped = [], set(), 0
+    for b in blocks:
+        first = b[0].strip()
+        if re.match(r"^[A-Z]$|^\d+$|^---+", first):
+            skipped += 1
+            continue
+        pieces = [x.strip() for x in first.split(",")]
+        heads = []
+        for x in pieces[:-1]:
+            if (head_re.match(x) and len(x) <= 25
+                    and (not heads or x[:3].lower() == heads[0][:3].lower())):
+                heads.append(x)
+            else:
+                break
+        if not heads:
+            if entries and not re.match(r"^[A-Z\-\s\d]+$", first):
+                entries[-1][1] += " " + " ".join(x.strip() for x in b)
+            else:
+                skipped += 1
+            continue
+        defi = ", ".join(pieces[len(heads):]).strip()
+        if len(b) > 1:
+            defi = (defi + " " + " ".join(x.strip() for x in b[1:])).strip()
+        defi = re.sub(r"\s+", " ", defi).strip(" ,;")
+        if not defi:
+            skipped += 1
+            continue
+        for h in heads[:5]:
+            key = (h.lower(), defi)
+            if key not in seen:
+                seen.add(key)
+                entries.append([h, defi])
+    print(f"  kawi KAWI->JV: {len(entries)} entri unik ({skipped} blok skip)")
+    return entries
+
+
+def load_kbji_snapshot(data_dir):
+    """data/kbji_raw.jsonl (parsial OK) -> list[(headword, definition)] dedup."""
+    p = os.path.join(data_dir, "kbji_raw.jsonl")
+    rows, seen = [], set()
+    if not os.path.exists(p):
+        return rows
+    with open(p, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue  # baris parsial (crawl berjalan)
+            head = (o.get("headword") or "").strip()
+            defi = (o.get("definition") or "").strip()
+            if not head or not defi:
+                continue
+            if (head.lower(), defi) in seen:
+                continue
+            seen.add((head.lower(), defi))
+            rows.append((head, defi))
+    return rows
+
+
+def classify_all(id_jv, jv_en, jv_jv, extra_jvmap=None):
+    """Beri level tiap entri. Returns (out_id, out_en, out_jv, out_kbji, lvl_dist).
+    Format SERAGAM 4 elemen: [kata, arti(strip), info, lvstr]."""
+    jvmap = {}
+
+    def feed(head, lv):
+        if lv:
+            jvmap.setdefault(head.lower(), set()).update(lv)
+
+    # JV pools dulu (peta untuk pewarisan ID->JV)
+    out_jv, out_en = [], []
+    for kata, arti in jv_jv:
+        lv, rest = extract_bausastra(arti)
+        if not lv:
+            lv = {"ngoko"}
+        feed(kata, lv)
+        out_jv.append([kata, rest, "", _lvl_str(lv)])
+    for kata, arti, pos in jv_en:
+        lv = extract_kaikki(arti)
+        feed(kata, lv)
+        out_en.append([kata, arti, pos, _lvl_str(lv)])
+    for head, defi in load_kbji_snapshot(DATA):
+        lv, _ = extract_kbji(head, defi)
+        feed(head, lv)
+    for w, lv in (extra_jvmap or {}).items():
+        feed(w, lv)
+
+    # pasangan KBJI resmi (dengan level + strip penanda depan)
+    snap = load_kbji_snapshot(DATA)
+    out_kbji, seen_kb = [], set()
+    for head, defi in snap:
+        lv, rest = extract_kbji(head, defi)
+        key = (head.lower(), rest)
+        if key in seen_kb:
+            continue
+        seen_kb.add(key)
+        out_kbji.append([head, rest, "", _lvl_str(lv)])
+    print(f"  kbji KBJI->ID: {len(out_kbji)} entri unik (dari {len(snap)} baris raw)")
+
+    # ID->JV: penanda depan + pewarisan dari padanan Jawa yg dikenal
+    out_id = []
+    tok_re = re.compile(r"[a-zêéè'\-]{3,}")
+    for kata, arti in id_jv:
+        lv, rest = extract_bausastra(arti)
+        for tok in set(tok_re.findall(arti.lower())):
+            if tok in jvmap:
+                lv.update(jvmap[tok])
+        out_id.append([kata, rest, "", _lvl_str(lv)])
+
+    dist = {}
+    for name, rows in (("id_jv", out_id), ("jv_en", out_en), ("jv_jv", out_jv),
+                       ("kbji", out_kbji)):
+        d = {}
+        for r in rows:
+            for lv in r[3].split(","):
+                if lv:
+                    d[lv] = d.get(lv, 0) + 1
+        dist[name] = d
+    return with_norm(out_id), with_norm(out_en), with_norm(out_jv), with_norm(out_kbji), dist
+
+
+def main() -> None:
+    status_only = "--status" in sys.argv
+    no_inline = "--no-inline" in sys.argv
+    id_jv, jv_en, jv_jv = [], [], []
+    p_csv = os.path.join(DATA, "dictionary.csv")
+    p_kai = os.path.join(DATA, "kaikki-jv.jsonl")
+    p_bat = os.path.join(DATA, "kamus_batangan.json")
+
+    if os.path.exists(p_csv):
+        id_jv = load_csv_id_jv(p_csv)
+        print(f"  sastra-jawa ID->JV: {len(id_jv)} entri unik")
+    if os.path.exists(p_kai):
+        jv_en = load_kaikki_jv_en(p_kai)
+        print(f"  kaikki JV->EN: {len(jv_en)} entri unik")
+    if os.path.exists(p_bat):
+        jv_jv = load_batangan(p_bat)
+        print(f"  batangan JV->JV: {len(jv_jv)} entri unik")
+    hf_pairs = load_hf_pairs(DATA) if os.path.isdir(DATA) else {}
+    habib_pairs, habib_lv = load_habib(DATA)
+    kawi_rows = load_kawi(DATA)
+
+    if not id_jv and not jv_en and not jv_jv and not hf_pairs and not habib_pairs and not kawi_rows:
+        print("TIDAK ADA SUMBER di data/. Jalankan tools/fetch_data.py dulu.")
+        return 1
+
+    out_id, out_en, out_jv, out_kbji, lvl_dist = classify_all(id_jv, jv_en, jv_jv,
+                                                              extra_jvmap=habib_lv)
+    out_kawi = with_norm([[h, d, "", ""] for h, d in kawi_rows])
+    buckets_id = to_buckets(out_id)
+    buckets_en = to_buckets(out_en)
+    buckets_jv = to_buckets(out_jv)
+    buckets_pad = to_buckets(habib_pairs)
+    buckets_kbji = to_buckets(out_kbji)
+    buckets_kawi = to_buckets(out_kawi)
+    hf_buckets = {p: to_buckets(r) for p, r in hf_pairs.items()}
+
+    meta = {"version": VERSION, "built": date.today().isoformat(),
+            "counts": {"id_jv": len(out_id), "jv_en": len(out_en), "jv_jv": len(out_jv),
+                       "padanan": len(habib_pairs), "kbji": len(out_kbji),
+                       "kawi": len(out_kawi),
+                       **{p: len(r) for p, r in hf_pairs.items()}},
+            "levels": lvl_dist}
+    print(f"  LEVELS: {lvl_dist}")
+    print(f"  META: {meta}")
+
+    if status_only:
+        return 0
+
+    region = (
+        "// KAMUS DATA - dibangkitkan tools/build_kamus.py, JANGAN edit manual\n"
+        "// Sumber: sastra-jawa (ID->JV) + kaikki Wiktionary (JV->EN)"
+        " + batangan/Poerwadarminta (JV->JV) + habib/kamus-jawa-api (padanan)"
+        + (" + HF manual (%s)" % ",".join(sorted(hf_pairs)) if hf_pairs else "") + "\n"
+        f"{MARKER_META} = {js_safe_json(meta)};\n"
+        f"{MARKER_IDJV} = {js_safe_json(buckets_id)};\n"
+        f"{MARKER_JVEN} = {js_safe_json(buckets_en)};\n"
+        f"{MARKER_JVJV} = {js_safe_json(buckets_jv)};\n"
+        f"{MARKER_PAD} = {js_safe_json(buckets_pad)};\n"
+        f"{MARKER_KBJI} = {js_safe_json(buckets_kbji)};\n"
+        f"{MARKER_KAWI} = {js_safe_json(buckets_kawi)};\n"
+    )
+    for p in sorted(hf_buckets):
+        const = "const KAMUS_" + p.upper()
+        region += f"{const} = {js_safe_json(hf_buckets[p])};\n"
+
+    fd, tmp = tempfile.mkstemp(dir=ROOT, suffix=".tmp")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(region)
+    os.replace(tmp, OUT)
+
+    # --- verifikasi: re-parse dari disk (pola embed_fulltext.py) ---
+    with open(OUT, encoding="utf-8") as f:
+        chk = f.read()
+    assert chk.count(MARKER_META) == 1, "marker META != 1"
+    assert chk.count(MARKER_IDJV) == 1, "marker ID_JV != 1"
+    assert chk.count(MARKER_JVEN) == 1, "marker JV_EN != 1"
+    assert chk.count(MARKER_JVJV) == 1, "marker JV_JV != 1"
+    assert chk.count(MARKER_PAD) == 1, "marker PADANAN != 1"
+    assert chk.count(MARKER_KBJI) == 1, "marker KBJI != 1"
+    assert chk.count(MARKER_KAWI) == 1, "marker KAWI != 1"
+    dec = json.JSONDecoder()
+    m0 = chk.find("{", chk.find(MARKER_META))
+    m1 = chk.find("{", chk.find(MARKER_IDJV))
+    m2 = chk.find("{", chk.find(MARKER_JVEN))
+    m3 = chk.find("{", chk.find(MARKER_JVJV))
+    m4 = chk.find("{", chk.find(MARKER_PAD))
+    m5 = chk.find("{", chk.find(MARKER_KBJI))
+    m6 = chk.find("{", chk.find(MARKER_KAWI))
+    meta2, _ = dec.raw_decode(chk[m0:])
+    id2, _ = dec.raw_decode(chk[m1:])
+    en2, _ = dec.raw_decode(chk[m2:])
+    jv2, _ = dec.raw_decode(chk[m3:])
+    pad2, _ = dec.raw_decode(chk[m4:])
+    kbji2, _ = dec.raw_decode(chk[m5:])
+    kawi2, _ = dec.raw_decode(chk[m6:])
+    n_id = sum(len(v) for v in id2.values())
+    n_en = sum(len(v) for v in en2.values())
+    n_jv = sum(len(v) for v in jv2.values())
+    n_pad = sum(len(v) for v in pad2.values())
+    n_kbji = sum(len(v) for v in kbji2.values())
+    n_kawi = sum(len(v) for v in kawi2.values())
+    assert n_id == len(id_jv), f"ID_JV {n_id} != {len(id_jv)}"
+    assert n_en == len(jv_en), f"JV_EN {n_en} != {len(jv_en)}"
+    assert n_jv == len(jv_jv), f"JV_JV {n_jv} != {len(jv_jv)}"
+    assert n_pad == len(habib_pairs), f"PADANAN {n_pad} != {len(habib_pairs)}"
+    assert n_kbji == len(out_kbji), f"KBJI {n_kbji} != {len(out_kbji)}"
+    assert n_kawi == len(out_kawi), f"KAWI {n_kawi} != {len(out_kawi)}"
+    assert meta2["counts"] == meta["counts"], "META mismatch"
+    print(f"Wrote {OUT} ({os.path.getsize(OUT)} bytes); "
+          f"post-write OK: ID_JV={n_id} JV_EN={n_en} JV_JV={n_jv} "
+          f"PADANAN={n_pad} KBJI={n_kbji} KAWI={n_kawi}")
+    print("BUILD_KAMUS_OK")
+
+    if not no_inline:
+        inline_into_html(region)
+    return 0
+
+
+def inline_into_html(region: str) -> None:
+    """Sisipkan blob data (region yg sama dgn kamus_data.js) ke index.html
+    di antara anchor KAMUS-DATA-START/END, menggantikan <script src>.
+    Membuat index.html mandiri (pola Katolik): tetap jalan saat dibuka via
+    content:// dari file manager Chrome yg memblokir script eksternal."""
+    with open(HTML, encoding="utf-8") as f:
+        html = f.read()
+    a = html.find(A_START)
+    assert a >= 0, "anchor KAMUS-DATA-START tidak ditemukan di index.html"
+    b = html.find(A_END, a)
+    assert b > a, "anchor KAMUS-DATA-END tidak ditemukan"
+    assert html.count(A_START) == 1 and html.count(A_END) == 1, "anchor ganda!"
+    start_line_end = html.find("\n", a) + 1
+    new_html = (html[:start_line_end]
+                + "<script>\n" + region + "</script>\n"
+                + html[b:])
+    assert 'src="kamus_data.js"' not in new_html, "ref eksternal masih ada!"
+    assert new_html.count(MARKER_META) == 1, "META ganda di HTML!"
+
+    fd, tmp = tempfile.mkstemp(dir=ROOT, suffix=".tmp")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(new_html)
+    os.replace(tmp, HTML)
+
+    # verifikasi dari disk: META ter-parse & counts cocok
+    with open(HTML, encoding="utf-8") as f:
+        chk = f.read()
+    m0 = chk.find("{", chk.find(MARKER_META))
+    meta2, _ = json.JSONDecoder().raw_decode(chk[m0:])
+    assert meta2.get("version") == VERSION, "META HTML rusak"
+    print(f"Inlined data -> {HTML} ({os.path.getsize(HTML)} bytes); "
+          f"counts={meta2['counts']}")
+    print("INLINE_OK")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
